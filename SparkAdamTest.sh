@@ -12,6 +12,9 @@ eggo-cluster provision -n 11 --worker-instance-type m3.xlarge --stack-name adamT
 #login to the cluster
 eggo-cluster login --stack-name adamTest1
 
+# Q: I might be missing something here, why ./s3cmd-master/s3cmd here and
+# /home/ec2-user/s3cmd-master/s3cmd below? Is the latter one installed/provided by eggo?
+
 # Get s3cmd
 wget https://github.com/s3tools/s3cmd/archive/master.zip
 unzip master.zip
@@ -29,14 +32,35 @@ cd 1kg
 # Create 1kg dir on hdfs
 hadoop fs -mkdir /user/ec2-user/1kg
 
+#
+# From a thread on adam-developers mailing list:
+#
+# One high-level thing to check — make sure that you've configured Parquet with a block size
+# that is identical to HDFS. A mismatch will hurt performance since you will likely need to
+# fetch remote blocks over the network.
+# ...
+#
+
 # Copy to hdfs
-zcat /home/ec2-user/1kg/ALL.chr22.phase3_shapeit2_mvncall_integrated_v5a.20130502.genotypes.vcf.gz | hadoop fs -put -  /user/ec2-user/1kg/chr22.vcf
+zcat /home/ec2-user/1kg/ALL.chr22.phase3_shapeit2_mvncall_integrated_v5a.20130502.genotypes.vcf.gz | hadoop fs -D dfs.block.size=134217728 -put - /user/ec2-user/1kg/chr22.vcf
 
 # Go to the adam directory
 cd /home/ec2-user/adam/bin/
 
+#
+# ...
+# You're right to be concerned about generating lots of 3MB files on HDFS, with time it will
+# impact your HDFS performance and scalability. It's good to choose a coalesce value that will
+# generate partitions about the size of your HDFS/Parquet block size. It appears that your
+# input file is ~1.5 GB so you would want to use a coalesce of ~(10-12) (=1.5G/128M) to create
+# 12 128 MB partitions. Of course, this will cause your write performance to suffer but will be
+# significantly improve your read path. 
+#
+# https://groups.google.com/forum/?hl=en#!topic/adam-developers/fbf9K9ce12U
+#
+
 # Convert vcf file to adam/parquet format (18 minutes)
-./adam-submit --master yarn-client --driver-memory 8g --num-executors 11 --executor-cores 4 --executor-memory 12531875840 -- vcf2adam -parquet_compression_codec SNAPPY   /user/ec2-user/1kg/chr22.vcf /user/ec2-user/1kg/chr22.adam
+./adam-submit --master yarn-client --driver-memory 8g --num-executors 11 --executor-cores 4 --executor-memory 12531875840 -- vcf2adam -parquet_compression_codec SNAPPY -coalesce 10 /user/ec2-user/1kg/chr22.vcf /user/ec2-user/1kg/chr22.adam
 
 #15/11/10 11:54:02 INFO DAGScheduler: Stage 0 (saveAsNewAPIHadoopFile at ADAMRDDFunctions.scala:75) finished in 1080.302  
 
@@ -55,8 +79,15 @@ import org.bdgenomics.formats.avro._
 # Create the AdamContext
 val ac = new ADAMContext(sc)
 
+# A projection limits the fields pulled into RAM, e.g.
+
+import org.bdgenomics.adam.projections.Projection
+import org.bdgenomics.adam.projections.GenotypeField._
+
+val projection = Some(Projection(variant, alleles))
+
 # Define the genotypes RDD
-val genotypes  = ac.loadGenotypes("/user/ec2-user/1kg/chr22.adam")
+val genotypes  = ac.loadGenotypes("/user/ec2-user/1kg/chr22.adam", projection)
 
 #count the genotypes (8 minutes)
 genotypes.count 
